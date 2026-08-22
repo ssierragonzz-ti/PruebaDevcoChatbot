@@ -15,6 +15,17 @@ Arquitectura:
 - El log de conversaciones puede persistir en una hoja de Google Sheets
   (si hay credenciales de service account en Secrets); si no, cae de
   vuelta al CSV local no persistente (comportamiento original).
+- Los "botones de interés" del sidebar responden de dos formas distintas
+  a propósito:
+    * instantáneas -> se contestan con texto fijo, SIN llamar a Gemini
+      (costo cero, cero riesgo de alucinación, no cuentan para el límite
+      de mensajes por sesión).
+    * llm -> se mandan como si el usuario las hubiera escrito, para que
+      el modelo razone (recomendaciones, comparaciones).
+  Este patrón híbrido (menú determinístico + LLM solo donde aporta) es
+  el mismo que usan la mayoría de bots de atención al cliente de retail
+  (catálogos de WhatsApp Business, Intercom Fin, etc.) y es lo que hace
+  viable operar esto a bajo costo.
 """
 
 from __future__ import annotations
@@ -31,6 +42,7 @@ import urllib.request
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Literal
 
 import streamlit as st
 from google import genai
@@ -66,6 +78,8 @@ RETRYABLE_STATUS_CODES = {429, 500, 502, 503}
 
 # Límite blando de mensajes por sesión: protege la cuenta de Gemini de un
 # uso ilimitado por visitante. No es un límite de seguridad, es de costo.
+# Las respuestas instantáneas (botones de info fija) NO cuentan para este
+# límite porque no llaman a la API.
 MAX_MENSAJES_POR_SESION = int(os.getenv("MACBOT_MAX_MENSAJES_SESION", "40"))
 
 LOG_FILE = os.getenv("MACBOT_LOG_FILE", "logs.csv")
@@ -104,17 +118,48 @@ CATALOGO_EMBEBIDO: list[dict[str, str]] = [
     {"categoria": "Accesorios y otros", "producto": "Fundas, cargadores y cables originales", "detalle": "", "precio_texto": "precios desde $69,000"},
 ]
 
+
+# =============================================================================
+# DATOS DE LA TIENDA (fuente única: se usan tanto en el prompt del LLM como
+# en las respuestas instantáneas de los botones, para que nunca queden
+# desincronizados entre sí).
+# =============================================================================
+
+@dataclass(frozen=True)
+class InfoTienda:
+    nombre: str
+    horario_texto: str
+    direccion: str
+    whatsapp_numero: str  # solo dígitos, con código de país, sin '+' ni espacios
+    web: str
+    instagram: str
+
+    @property
+    def whatsapp_link(self) -> str:
+        return f"https://wa.me/{self.whatsapp_numero}"
+
+
+# ⚠️ Editar estos valores con los datos reales de la tienda.
+INFO_TIENDA = InfoTienda(
+    nombre="MacStore Ejemplo",
+    horario_texto="Lunes a sábado 9:00-20:00, domingo 10:00-18:00 (festivos: 10:00-17:00).",
+    direccion="Centro Comercial X, local 123, Bogotá.",
+    whatsapp_numero="573000000000",
+    web="www.macstore-ejemplo.com",
+    instagram="@macstoreejemplo",
+)
+
 SYSTEM_PROMPT_TEMPLATE = """
-Eres "MacBot", el asistente virtual de MacStore Ejemplo, una tienda
+Eres "MacBot", el asistente virtual de {nombre_tienda}, una tienda
 especializada en productos Apple. Respondes de forma amable, clara y
 breve (máximo 3 párrafos), con emojis moderados.
 
 ## Datos de la tienda
-- Horario: Lunes a sábado 9:00-20:00, domingo 10:00-18:00 (festivos: 10:00-17:00).
-- Dirección: Centro Comercial X, local 123, Bogotá.
-- WhatsApp: +57 300 000 0000 -> https://wa.me/573000000000
-- Web: www.macstore-ejemplo.com
-- Redes: @macstoreejemplo en Instagram
+- Horario: {horario}
+- Dirección: {direccion}
+- WhatsApp: {whatsapp_link}
+- Web: {web}
+- Redes: {instagram} en Instagram
 
 ## Catálogo destacado
 {catalogo}
@@ -129,13 +174,21 @@ breve (máximo 3 párrafos), con emojis moderados.
 - Evitar perder cosas: AirTag.
 - Si el catálogo fue editado y alguno de estos modelos ya no aparece,
   prioriza siempre lo que sí esté en el catálogo vigente arriba.
+- Si piden comparar dos o más productos del catálogo, arma una
+  comparación breve en viñetas (precio, para quién es mejor cada uno).
+- Si preguntan por un producto Apple que no aparece en el catálogo
+  vigente (por ejemplo, un modelo descontinuado o uno que la tienda no
+  maneja), acláralo con honestidad y ofrece la alternativa más cercana
+  del catálogo actual, o deriva a WhatsApp para confirmar disponibilidad.
 
 ## Políticas
 - Garantía: 1 año con Apple en todos los productos; AppleCare+ opcional (cobertura extendida y daños accidentales).
 - Devoluciones: 30 días en empaque original con factura.
-- Reparaciones: diagnóstico gratuito, solo repuestos originales, en centro de servicio autorizado.
+- Reparaciones: diagnóstico gratuito, solo repuestos originales, en centro de servicio autorizado. Fuera de garantía, el costo de repuestos y mano de obra se cotiza después del diagnóstico, no antes.
 - Envíos: Bogotá mismo día (pedidos antes de las 3pm), otras ciudades 1-2 días hábiles.
 - Financiación: hasta 24 cuotas con tarjetas de crédito aliadas; consulta bancos participantes por WhatsApp.
+- Formas de pago en tienda: efectivo, tarjeta débito/crédito y medios digitales habituales (confirmar el detalle exacto por WhatsApp, puede variar).
+- Apartado de producto: se puede reservar con un abono; condiciones exactas por WhatsApp.
 - Plan de renovación (trade-in): recibimos tu equipo Apple usado como parte de pago; el valor depende del modelo y estado, se evalúa en tienda o por fotos vía WhatsApp.
 - Descuento estudiantes: aplica con carné vigente, consultar vigencia y porcentaje actual por WhatsApp.
 
@@ -147,13 +200,66 @@ breve (máximo 3 párrafos), con emojis moderados.
 - No inventes precios, stock ni características que no estén aquí. Si no sabes algo, dilo y deriva a un humano.
 - Nunca pidas datos sensibles como números de tarjeta, claves o contraseñas.
 - Si el mensaje no tiene relación con la tienda ni con productos Apple, redirige amablemente la conversación.
+- Responde siempre en el mismo idioma en el que te escribe el visitante (si escribe en inglés, respondes en inglés, manteniendo el mismo tono).
 """
 
-QUICK_QUESTIONS: tuple[str, ...] = (
-    "¿Cuál es el horario de la tienda?",
-    "¿Qué iPhone me recomiendas para fotografía?",
-    "¿Cómo funciona la garantía?",
-    "Quiero hablar con un asesor",
+# Respuestas fijas para los botones "instantáneos": no llaman a Gemini, así
+# que tienen costo cero y no pueden alucinar datos de la tienda. Se
+# construyen a partir de INFO_TIENDA para no repetir los datos a mano.
+CANNED_ANSWERS: dict[str, str] = {
+    "horario": (
+        f"🕒 Nuestro horario es: {INFO_TIENDA.horario_texto}\n\n"
+        f"📍 Nos encuentras en: {INFO_TIENDA.direccion}"
+    ),
+    "garantia": (
+        "🛡️ Todos los productos tienen 1 año de garantía con Apple. "
+        "Puedes agregar AppleCare+ para cobertura extendida y daños accidentales.\n\n"
+        "**Devoluciones:** 30 días, en empaque original y con factura.\n\n"
+        "**Reparaciones fuera de garantía:** el diagnóstico es gratuito; el "
+        "costo de repuestos y mano de obra se cotiza después de revisar el equipo."
+    ),
+    "envios": (
+        "🚚 **Bogotá:** mismo día si el pedido es antes de las 3:00pm.\n"
+        "🚚 **Otras ciudades:** 1-2 días hábiles.\n\n"
+        "También puedes recoger en tienda si prefieres apartar el producto primero."
+    ),
+    "financiacion": (
+        "💳 Financiamos hasta 24 cuotas con tarjetas de crédito aliadas, además de "
+        "pago en efectivo, tarjeta débito/crédito y medios digitales habituales.\n\n"
+        f"Para confirmar bancos y condiciones exactas, escríbenos por WhatsApp: {INFO_TIENDA.whatsapp_link}"
+    ),
+    "trade_in": (
+        "🔄 Recibimos tu equipo Apple usado como parte de pago (plan renove). "
+        "El valor depende del modelo y el estado; lo evaluamos en tienda o con "
+        "fotos por WhatsApp.\n\n"
+        f"Cotízalo aquí: {INFO_TIENDA.whatsapp_link}"
+    ),
+}
+
+
+@dataclass(frozen=True)
+class AccionRapida:
+    """Un botón del sidebar.
+
+    tipo="instantanea": responde con CANNED_ANSWERS[valor], sin llamar a
+    Gemini (gratis, no cuenta para el límite de mensajes por sesión).
+    tipo="llm": envía `valor` como si el usuario lo hubiera escrito, para
+    que el modelo razone (recomendaciones, comparaciones, etc.).
+    """
+    etiqueta: str
+    tipo: Literal["instantanea", "llm"]
+    valor: str
+
+
+QUICK_ACTIONS: tuple[AccionRapida, ...] = (
+    AccionRapida("🕒 Horario y ubicación", "instantanea", "horario"),
+    AccionRapida("🛡️ Garantía y devoluciones", "instantanea", "garantia"),
+    AccionRapida("🚚 Envíos", "instantanea", "envios"),
+    AccionRapida("💳 Financiación y pagos", "instantanea", "financiacion"),
+    AccionRapida("🔄 Plan renove (trade-in)", "instantanea", "trade_in"),
+    AccionRapida("📱 ¿Qué iPhone me recomiendas?", "llm", "¿Qué iPhone me recomiendas según mi uso? Pregúntame para qué lo necesito."),
+    AccionRapida("⚖️ Comparar dos productos", "llm", "Quiero comparar dos productos del catálogo, ayúdame a elegir cuáles comparar según mi uso."),
+    AccionRapida("🎓 Descuento de estudiante", "llm", "¿Cómo funciona el descuento de estudiante?"),
 )
 
 
@@ -189,7 +295,7 @@ def _leer_secreto(nombre: str) -> str | None:
 # =============================================================================
 
 @st.cache_data(ttl=600, show_spinner=False)
-def cargar_catalogo() -> tuple[list[dict[str, str]], str]:
+def cargar_catalogo() -> tuple[list[dict[str, str]], str, str | None]:
     """
     Carga el catálogo desde una hoja de Google Sheets publicada como CSV
     (Archivo > Compartir > Publicar en la Web > CSV), cuya URL se configura
@@ -197,33 +303,39 @@ def cargar_catalogo() -> tuple[list[dict[str, str]], str]:
     la carga falla por cualquier motivo (URL caída, columnas incorrectas,
     hoja vacía), se usa el catálogo embebido en el código como respaldo.
 
-    Devuelve (filas, origen), con origen en {"sheet", "embebido"}, para
-    poder mostrarlo en la interfaz.
+    Devuelve (filas, origen, motivo_fallback):
+    - origen en {"sheet", "embebido"}, para mostrarlo en la interfaz.
+    - motivo_fallback: None si todo salió bien (o si simplemente no hay URL
+      configurada); si no, un texto corto explicando por qué se usó el
+      catálogo embebido en vez de la hoja (útil para el panel de admin,
+      p. ej. cuando la hoja está publicada pero todavía no tiene filas).
     """
     url = _leer_secreto("CATALOG_SHEET_CSV_URL")
-    if url:
-        try:
-            with urllib.request.urlopen(url, timeout=10) as respuesta:
-                contenido = respuesta.read().decode("utf-8-sig")
-            lector = csv.DictReader(io.StringIO(contenido))
-            columnas = set(lector.fieldnames or [])
-            faltantes = set(CATALOGO_COLUMNAS_REQUERIDAS) - columnas
-            if faltantes:
-                raise ValueError(f"faltan columnas en la hoja: {sorted(faltantes)}")
-            filas = [
-                {c: (fila.get(c) or "").strip() for c in CATALOGO_COLUMNAS_REQUERIDAS}
-                for fila in lector
-            ]
-            filas = [f for f in filas if f["producto"]]
-            if not filas:
-                raise ValueError("la hoja no tiene filas de productos")
-            return filas, "sheet"
-        except (urllib.error.URLError, ValueError, TimeoutError, OSError) as e:
-            logger.warning(
-                "No se pudo cargar el catálogo desde la hoja de cálculo (%s). "
-                "Se usa el catálogo embebido como respaldo.", e,
-            )
-    return CATALOGO_EMBEBIDO, "embebido"
+    if not url:
+        return CATALOGO_EMBEBIDO, "embebido", None
+    try:
+        with urllib.request.urlopen(url, timeout=10) as respuesta:
+            contenido = respuesta.read().decode("utf-8-sig")
+        lector = csv.DictReader(io.StringIO(contenido))
+        columnas = set(lector.fieldnames or [])
+        faltantes = set(CATALOGO_COLUMNAS_REQUERIDAS) - columnas
+        if faltantes:
+            raise ValueError(f"faltan columnas en la hoja: {sorted(faltantes)}")
+        filas = [
+            {c: (fila.get(c) or "").strip() for c in CATALOGO_COLUMNAS_REQUERIDAS}
+            for fila in lector
+        ]
+        filas = [f for f in filas if f["producto"]]
+        if not filas:
+            raise ValueError("la hoja está publicada pero todavía no tiene filas de productos")
+        return filas, "sheet", None
+    except (urllib.error.URLError, ValueError, TimeoutError, OSError) as e:
+        motivo = str(e)
+        logger.warning(
+            "No se pudo cargar el catálogo desde la hoja de cálculo (%s). "
+            "Se usa el catálogo embebido como respaldo.", motivo,
+        )
+        return CATALOGO_EMBEBIDO, "embebido", motivo
 
 
 def formatear_catalogo(filas: list[dict[str, str]]) -> str:
@@ -319,9 +431,17 @@ def construir_generation_config() -> types.GenerateContentConfig:
     de tono/consistencia se hace vía system_instruction, que es lo que
     ahora recomienda Google como reemplazo.
     """
-    filas, _origen = cargar_catalogo()
+    filas, _origen, _motivo = cargar_catalogo()
     catalogo_texto = formatear_catalogo(filas)
-    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(catalogo=catalogo_texto)
+    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
+        catalogo=catalogo_texto,
+        nombre_tienda=INFO_TIENDA.nombre,
+        horario=INFO_TIENDA.horario_texto,
+        direccion=INFO_TIENDA.direccion,
+        whatsapp_link=INFO_TIENDA.whatsapp_link,
+        web=INFO_TIENDA.web,
+        instagram=INFO_TIENDA.instagram,
+    )
     return types.GenerateContentConfig(
         system_instruction=system_prompt,
         max_output_tokens=500,
@@ -336,10 +456,21 @@ def obtener_chat_de_sesion(cliente: genai.Client, modelo: ModeloResuelto):
     una conversación ya abierta, esa conversación sigue viendo el catálogo
     que tenía al iniciar. Las conversaciones nuevas sí ven el cambio,
     sujeto al caché de 10 minutos de cargar_catalogo().
+
+    Si crear la sesión falla (red, cuota, etc.) se muestra un error
+    amigable en vez de dejar que Streamlit rompa con una traza cruda.
     """
     if "chat" not in st.session_state:
-        config = construir_generation_config()
-        st.session_state.chat = cliente.chats.create(model=modelo.nombre, config=config)
+        try:
+            config = construir_generation_config()
+            st.session_state.chat = cliente.chats.create(model=modelo.nombre, config=config)
+        except Exception as e:
+            logger.error("No se pudo crear la sesión de chat (%s).", e)
+            st.error(
+                "No se pudo iniciar el asistente en este momento. "
+                "Recarga la página o intenta de nuevo en unos minutos."
+            )
+            st.stop()
     return st.session_state.chat
 
 
@@ -445,6 +576,11 @@ def guardar_log(mensaje: str, respuesta: str, modelo: str) -> None:
     se usa esa (persiste entre redeploys); si no, o si falla la escritura,
     cae de vuelta al CSV local. Un fallo al loguear nunca debe tumbar la
     conversación del usuario.
+
+    `modelo` puede ser el nombre real del modelo de Gemini, o la etiqueta
+    "instantánea (sin IA)" para las respuestas de los botones fijos, así
+    el panel de métricas puede distinguir cuánto tráfico se resuelve sin
+    costo de API.
     """
     fila = [datetime.now(timezone.utc).isoformat(), modelo, mensaje, respuesta]
     hoja = _obtener_hoja_log()
@@ -483,12 +619,28 @@ def _leer_filas_log() -> list[dict[str, str]]:
 
 def mostrar_panel_metricas() -> None:
     filas = _leer_filas_log()
+
+    _catalogo_filas, origen_catalogo, motivo_fallback = cargar_catalogo()
+    if origen_catalogo == "sheet":
+        st.success(f"Catálogo activo: hoja de cálculo ({len(_catalogo_filas)} productos).")
+    elif motivo_fallback:
+        st.warning(
+            f"Catálogo activo: embebido en el código. Hay una hoja "
+            f"configurada pero no se pudo usar ({motivo_fallback})."
+        )
+    else:
+        st.info("Catálogo activo: embebido en el código (no hay hoja configurada).")
+
     if not filas:
         st.info("Todavía no hay conversaciones registradas.")
         return
 
     total = len(filas)
     st.metric("Conversaciones registradas", total)
+
+    instantaneas = sum(1 for f in filas if "instant" in (f.get("modelo") or "").lower())
+    if instantaneas:
+        st.caption(f"De esas, {instantaneas} se resolvieron con botones instantáneos (costo cero de API).")
 
     por_dia: Counter[str] = Counter()
     for f in filas:
@@ -527,10 +679,27 @@ def mostrar_panel_metricas() -> None:
 # INTERFAZ
 # =============================================================================
 
+def _responder_instantanea(clave: str, etiqueta_boton: str) -> None:
+    """Atiende un botón de respuesta instantánea: la agrega directamente al
+    historial de la conversación, sin pasar por Gemini, y la loguea. No
+    cuenta para MAX_MENSAJES_POR_SESION porque no usa la API."""
+    texto = CANNED_ANSWERS[clave]
+    st.session_state.messages.append({"role": "user", "content": etiqueta_boton})
+    st.session_state.messages.append({"role": "assistant", "content": texto})
+    guardar_log(etiqueta_boton, texto, "instantánea (sin IA)")
+
+
 def main() -> None:
     st.set_page_config(page_title="MacBot", page_icon="🍎")
     st.title("🍎 MacBot - Asistente Virtual")
     st.caption("Pregunta por productos Apple, garantías, envíos y más.")
+
+    # Se inicializa ANTES del sidebar porque algunos botones (respuestas
+    # instantáneas) escriben directamente en st.session_state.messages.
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+    if "turnos" not in st.session_state:
+        st.session_state.turnos = 0
 
     cliente = obtener_cliente()
     try:
@@ -545,14 +714,51 @@ def main() -> None:
     with st.sidebar:
         st.subheader("Preguntas rápidas")
         st.caption(f"Modelo activo: {modelo.nombre}")
-        _, origen_catalogo = cargar_catalogo()
+        _, origen_catalogo, _motivo = cargar_catalogo()
         st.caption(
             "Catálogo: hoja de cálculo" if origen_catalogo == "sheet"
             else "Catálogo: embebido en el código"
         )
-        for pregunta in QUICK_QUESTIONS:
-            if st.button(pregunta, use_container_width=True):
-                st.session_state.pending_prompt = pregunta
+
+        for accion in QUICK_ACTIONS:
+            if st.button(accion.etiqueta, width="stretch", key=f"quick_{accion.tipo}_{accion.valor}"):
+                if accion.tipo == "instantanea":
+                    _responder_instantanea(accion.valor, accion.etiqueta)
+                else:
+                    st.session_state.pending_prompt = accion.valor
+
+        st.link_button(
+            "💬 Hablar con un asesor (WhatsApp)",
+            INFO_TIENDA.whatsapp_link,
+            width="stretch",
+        )
+
+        with st.expander("📋 Ver catálogo completo"):
+            filas_catalogo, _origen, _motivo = cargar_catalogo()
+            st.dataframe(
+                [
+                    {
+                        "Categoría": f["categoria"],
+                        "Producto": f["producto"],
+                        "Detalle": f["detalle"],
+                        "Precio": f["precio_texto"],
+                    }
+                    for f in filas_catalogo
+                ],
+                hide_index=True,
+                width="stretch",
+            )
+
+        st.divider()
+        if st.button(
+            "🔄 Nueva conversación",
+            width="stretch",
+            help="Borra el historial visible y empieza un chat nuevo. El límite de mensajes por sesión no se reinicia.",
+        ):
+            st.session_state.messages = []
+            st.session_state.pop("chat", None)
+            st.session_state.pop("pending_prompt", None)
+            st.rerun()
 
         st.divider()
         with st.expander("📊 Métricas (admin)"):
@@ -568,11 +774,6 @@ def main() -> None:
                     mostrar_panel_metricas()
                 elif intento:
                     st.error("Contraseña incorrecta.")
-
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-    if "turnos" not in st.session_state:
-        st.session_state.turnos = 0
 
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
@@ -591,8 +792,7 @@ def main() -> None:
             if st.session_state.turnos >= MAX_MENSAJES_POR_SESION:
                 texto = (
                     "Llegamos al límite de mensajes para esta conversación 🙏. "
-                    "Para seguir, escríbenos directo por WhatsApp: "
-                    "https://wa.me/573000000000"
+                    f"Para seguir, escríbenos directo por WhatsApp: {INFO_TIENDA.whatsapp_link}"
                 )
                 st.markdown(texto)
             else:
