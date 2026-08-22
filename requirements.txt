@@ -1,0 +1,10 @@
+streamlit
+google-genai
+
+# Usadas solo si se configura el log de conversaciones en Google Sheets
+# (secrets: LOG_SHEET_ID y GOOGLE_SERVICE_ACCOUNT_JSON). El catálogo NO
+# necesita estas dependencias: se lee con urllib/csv de la librería
+# estándar. Si no configuras el log en Sheets, estas dos igual se instalan
+# pero nunca se importan (el código cae solo al CSV local).
+gspread
+google-auth
