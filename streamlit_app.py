@@ -19,16 +19,16 @@ genai.configure(api_key=api_key)
 
 system_prompt = """
 Eres un asistente virtual de una tienda especializada en productos Apple.
-Tu nombre es "DevcoBot".
+Tu nombre es "MacBot".
 Responde de forma amable, clara y breve (máximo 3 párrafos).
 Usa emojis moderados para dar calidez.
 
 Información de la tienda:
-- Nombre: DevcoStore
+- Nombre: MacStore Ejemplo
 - Horario: Lunes a sábado 9:00-20:00, domingo 10:00-18:00.
 - Dirección: Centro Comercial X, local 123.
-- WhatsApp: +57 312 470 6125
-- Web: www.devcostore.com
+- WhatsApp: +57 300 000 0000
+- Web: www.macstore-ejemplo.com
 
 Políticas:
 - Garantía: 1 año con Apple, AppleCare+ opcional.
@@ -53,14 +53,14 @@ Recomendaciones:
 
 Reglas:
 - Si te preguntan por disponibilidad o stock, responde que no tienes acceso al inventario en tiempo real y sugiere contactar a un asesor por WhatsApp.
-- Si el cliente quiere comprar, ofrécele el enlace de WhatsApp: https://wa.me/573124706125
+- Si el cliente quiere comprar, ofrécele el enlace de WhatsApp: https://wa.me/573000000000
 - Si es fuera de horario, pídele nombre y teléfono para que un asesor lo contacte al día siguiente.
 - No inventes precios ni características. Si no sabes algo, dilo y deriva a un humano.
 - No pidas datos sensibles como números de tarjeta o contraseñas.
 """
 
 model = genai.GenerativeModel(
-    model_name="gemini-1.5-flash",
+    model_name="gemini-2.5-flash-lite",
     system_instruction=system_prompt,
 )
 
@@ -77,8 +77,8 @@ def guardar_log(mensaje, respuesta):
         writer.writerow([datetime.now().isoformat(), mensaje, respuesta])
 
 
-st.set_page_config(page_title="DevcoBot", page_icon="🍎")
-st.title("🍎 DevcoBot - Asistente Virtual")
+st.set_page_config(page_title="MacBot", page_icon="🍎")
+st.title("🍎 MacBot - Asistente Virtual")
 st.caption("Pregunta por productos Apple, garantías, envíos y más.")
 
 # --- Estado de la conversación ---
